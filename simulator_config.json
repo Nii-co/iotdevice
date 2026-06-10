@@ -2,7 +2,7 @@
   "send_interval_seconds": 10,
   "message_count": 0,
   "dps": {
-    "provisioning_host": "global.azure-devices-provisioning.cn",
+    "provisioning_host": "global.azure-devices-provisioning.net",
     "enrollment_groups": {
       "sensors-group": {
         "id_scope_env": "DPS_IDSCOPE_SENSORS",

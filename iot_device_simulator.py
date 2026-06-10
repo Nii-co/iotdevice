@@ -34,7 +34,7 @@ from pathlib import Path
 # 单设备模式 (--mode single):
 #   方式1: 设备连接字符串
 #     设置环境变量: IOTHUB_DEVICE_CONNECTION_STRING
-#     格式: HostName=<hub>.azure-devices.cn;DeviceId=<id>;SharedAccessKey=<key>  (中国云 .cn)
+#     格式: HostName=<hub>.azure-devices.net;DeviceId=<id>;SharedAccessKey=<key>  (国际版 .net)
 #
 # 多设备模式 (--mode multi --config simulator_config.json):
 #   方式A (推荐): DPS + 对称密钥 Enrollment Group (配置文件含 "dps" 段)
@@ -626,7 +626,7 @@ CONFIG_TEMPLATE = """{
   "send_interval_seconds": 10,
   "message_count": 0,
   "dps": {
-    "provisioning_host": "global.azure-devices-provisioning.cn",
+    "provisioning_host": "global.azure-devices-provisioning.net",
     "enrollment_groups": {
       "sensors-group": {
         "id_scope_env": "DPS_IDSCOPE_SENSORS",
@@ -912,7 +912,7 @@ def main():
         elif "dps" in config:
             # ------ DPS 对称密钥 (Enrollment Group) 方式 ------
             dps_cfg = config["dps"]
-            prov_host = dps_cfg.get("provisioning_host", "global.azure-devices-provisioning.cn")
+            prov_host = dps_cfg.get("provisioning_host", "global.azure-devices-provisioning.net")
             groups = dps_cfg["enrollment_groups"]
 
             # 解析每个组的 id_scope 和组主密钥 (来自环境变量, 不入库)

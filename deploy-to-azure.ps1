@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    将 IoT 设备模拟器部署到 Azure Container Instance (ACI) — DPS + 对称密钥组方式 (Azure 中国云)
+    将 IoT 设备模拟器部署到 Azure Container Instance (ACI) — DPS + 对称密钥组方式 (Azure 国际版)
 
 .DESCRIPTION
     一键完成: 创建资源组 → 创建 ACR → 构建镜像 → 推送 → 部署 ACI
@@ -11,7 +11,7 @@
     Azure 资源组名称
 
 .PARAMETER Location
-    Azure 区域 (中国云默认 chinanorth3)
+    Azure 区域 (国际版默认 eastasia)
 
 .PARAMETER IdScopeSensors
     sensors-group 所属 DPS 的 ID Scope
@@ -41,7 +41,7 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$ResourceGroup,
 
-    [string]$Location = "chinanorth3",
+    [string]$Location = "eastasia",
 
     [Parameter(Mandatory=$true)]
     [string]$IdScopeSensors,

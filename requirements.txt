@@ -1,0 +1,2 @@
+azure-iot-device>=2.12
+azure-iot-hub>=2.6

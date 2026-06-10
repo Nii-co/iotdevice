@@ -1,0 +1,20 @@
+{
+  "iothub_connection_string": "HostName=<your-hub>.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=<key>",
+  "send_interval_seconds": 10,
+  "message_count": 0,
+  "devices": [
+    {"device_id": "device-wsd-01", "device_type": "temperature_humidity"},
+    {"device_id": "device-wsd-02", "device_type": "temperature_humidity"},
+    {"device_id": "device-wsd-03", "device_type": "temperature_humidity"},
+    {"device_id": "device-wsd-04", "device_type": "temperature_humidity"},
+    {"device_id": "device-cn-01",  "device_type": "energy_storage"},
+    {"device_id": "my-device-6",   "device_type": "power_meter"},
+    {"device_id": "my-device-3",   "device_type": "solar_panel"},
+    {"device_id": "my-device-28",  "device_type": "boiler"},
+    {"device_id": "my-device-16",  "device_type": "chiller"},
+    {"device_id": "my-device-55",  "device_type": "compressed_air"},
+    {"device_id": "my-device-77",  "device_type": "substation_meter"},
+    {"device_id": "my-device-19",  "device_type": "gas_flow"},
+    {"device_id": "my-device-65",  "device_type": "water_meter"}
+  ]
+}

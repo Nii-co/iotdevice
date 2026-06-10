@@ -1,20 +1,34 @@
 {
-  "iothub_connection_string": "HostName=<your-hub>.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=<key>",
   "send_interval_seconds": 10,
   "message_count": 0,
+  "dps": {
+    "provisioning_host": "global.azure-devices-provisioning.cn",
+    "enrollment_groups": {
+      "sensors-group": {
+        "id_scope_env": "DPS_IDSCOPE_SENSORS",
+        "group_master_key_env": "DPS_GROUPKEY_SENSORS",
+        "initial_twin_tags": {"site": "shanghai-plant-01", "environment": "prod", "firmwareTrack": "stable"}
+      },
+      "energy-group": {
+        "id_scope_env": "DPS_IDSCOPE_ENERGY",
+        "group_master_key_env": "DPS_GROUPKEY_ENERGY",
+        "initial_twin_tags": {"site": "shanghai-plant-02", "environment": "prod", "firmwareTrack": "canary"}
+      }
+    }
+  },
   "devices": [
-    {"device_id": "device-wsd-01", "device_type": "temperature_humidity"},
-    {"device_id": "device-wsd-02", "device_type": "temperature_humidity"},
-    {"device_id": "device-wsd-03", "device_type": "temperature_humidity"},
-    {"device_id": "device-wsd-04", "device_type": "temperature_humidity"},
-    {"device_id": "device-cn-01",  "device_type": "energy_storage"},
-    {"device_id": "my-device-6",   "device_type": "power_meter"},
-    {"device_id": "my-device-3",   "device_type": "solar_panel"},
-    {"device_id": "my-device-28",  "device_type": "boiler"},
-    {"device_id": "my-device-16",  "device_type": "chiller"},
-    {"device_id": "my-device-55",  "device_type": "compressed_air"},
-    {"device_id": "my-device-77",  "device_type": "substation_meter"},
-    {"device_id": "my-device-19",  "device_type": "gas_flow"},
-    {"device_id": "my-device-65",  "device_type": "water_meter"}
+    {"device_id": "device-wsd-01", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L1", "criticality": "normal"}},
+    {"device_id": "device-wsd-02", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L1", "criticality": "normal"}},
+    {"device_id": "device-wsd-03", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L2", "criticality": "normal"}},
+    {"device_id": "device-wsd-04", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L2", "criticality": "normal"}},
+    {"device_id": "my-device-19",  "device_type": "gas_flow",            "group": "sensors-group", "tags": {"line": "L3", "criticality": "high"}},
+    {"device_id": "my-device-65",  "device_type": "water_meter",         "group": "sensors-group", "tags": {"line": "L3", "criticality": "normal"}},
+    {"device_id": "device-cn-01",  "device_type": "energy_storage",      "group": "energy-group",  "tags": {"line": "P1", "criticality": "high"}},
+    {"device_id": "my-device-6",   "device_type": "power_meter",         "group": "energy-group",  "tags": {"line": "P1", "criticality": "high"}},
+    {"device_id": "my-device-3",   "device_type": "solar_panel",         "group": "energy-group",  "tags": {"line": "P2", "criticality": "normal"}},
+    {"device_id": "my-device-28",  "device_type": "boiler",              "group": "energy-group",  "tags": {"line": "P2", "criticality": "high"}},
+    {"device_id": "my-device-16",  "device_type": "chiller",             "group": "energy-group",  "tags": {"line": "P3", "criticality": "high"}},
+    {"device_id": "my-device-55",  "device_type": "compressed_air",      "group": "energy-group",  "tags": {"line": "P3", "criticality": "normal"}},
+    {"device_id": "my-device-77",  "device_type": "substation_meter",    "group": "energy-group",  "tags": {"line": "P4", "criticality": "high"}}
   ]
 }

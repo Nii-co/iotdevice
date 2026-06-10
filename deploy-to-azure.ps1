@@ -1,18 +1,29 @@
 <#
 .SYNOPSIS
-    将 IoT 设备模拟器部署到 Azure Container Instance (ACI)
+    将 IoT 设备模拟器部署到 Azure Container Instance (ACI) — DPS + 对称密钥组方式 (Azure 中国云)
 
 .DESCRIPTION
     一键完成: 创建资源组 → 创建 ACR → 构建镜像 → 推送 → 部署 ACI
+    设备通过 DPS 对称密钥 Enrollment Group 注册, 不再需要 iothubowner。
+    DPS ID Scope 与组主密钥通过 ACI 安全环境变量注入。
 
 .PARAMETER ResourceGroup
     Azure 资源组名称
 
 .PARAMETER Location
-    Azure 区域 (默认 eastasia)
+    Azure 区域 (中国云默认 chinanorth3)
 
-.PARAMETER IoTHubConnectionString
-    IoT Hub 服务连接字符串 (iothubowner)
+.PARAMETER IdScopeSensors
+    sensors-group 所属 DPS 的 ID Scope
+
+.PARAMETER GroupKeySensors
+    sensors-group 的组主密钥 (Primary Key, base64)
+
+.PARAMETER IdScopeEnergy
+    energy-group 所属 DPS 的 ID Scope (同一 DPS 时与 IdScopeSensors 相同)
+
+.PARAMETER GroupKeyEnergy
+    energy-group 的组主密钥 (Primary Key, base64)
 
 .PARAMETER SendInterval
     发送间隔秒数 (默认 10)
@@ -21,17 +32,28 @@
     每设备发送消息数 (0=无限, 默认 0)
 
 .EXAMPLE
-    .\deploy-to-azure.ps1 -ResourceGroup "rg-iot-simulator" -IoTHubConnectionString "HostName=..."
+    .\deploy-to-azure.ps1 -ResourceGroup "rg-iot-simulator" `
+        -IdScopeSensors "0ne00XXXXXX" -GroupKeySensors "<key>" `
+        -IdScopeEnergy "0ne00XXXXXX" -GroupKeyEnergy "<key>"
 #>
 
 param(
     [Parameter(Mandatory=$true)]
     [string]$ResourceGroup,
 
-    [string]$Location = "eastasia",
+    [string]$Location = "chinanorth3",
 
     [Parameter(Mandatory=$true)]
-    [string]$IoTHubConnectionString,
+    [string]$IdScopeSensors,
+
+    [Parameter(Mandatory=$true)]
+    [string]$GroupKeySensors,
+
+    [Parameter(Mandatory=$true)]
+    [string]$IdScopeEnergy,
+
+    [Parameter(Mandatory=$true)]
+    [string]$GroupKeyEnergy,
 
     [int]$SendInterval = 10,
 
@@ -84,10 +106,9 @@ $acrUser   = az acr credential show --name $AcrName --query username -o tsv
 $acrPass   = az acr credential show --name $AcrName --query "passwords[0].value" -o tsv
 
 # Step 5: 部署 ACI
+# 设备走 DPS 对称密钥组注册; ID Scope 与组主密钥通过安全环境变量注入,
+# 容器内 Python 由 os.environ 读取并按 registration_id 派生每台设备密钥。
 Write-Host "[5/5] Deploying container instance..." -ForegroundColor Yellow
-
-# 先更新配置文件中的连接字符串 (注入到镜像运行时通过环境变量无法直接覆盖 JSON)
-# 所以我们通过 ACI 的环境变量 + 修改启动命令来传递
 
 az container create `
     --resource-group $ResourceGroup `
@@ -100,11 +121,16 @@ az container create `
     --memory 0.5 `
     --restart-policy Always `
     --environment-variables `
-        "IOTHUB_CONNECTION_STRING=$IoTHubConnectionString" `
         "MODE=multi" `
+        "CONFIG_PATH=simulator_config.json" `
         "INTERVAL=$SendInterval" `
         "COUNT=$MessageCount" `
-    --command-line "python iot_device_simulator.py --mode multi --interval $SendInterval --count $MessageCount" `
+    --secure-environment-variables `
+        "DPS_IDSCOPE_SENSORS=$IdScopeSensors" `
+        "DPS_GROUPKEY_SENSORS=$GroupKeySensors" `
+        "DPS_IDSCOPE_ENERGY=$IdScopeEnergy" `
+        "DPS_GROUPKEY_ENERGY=$GroupKeyEnergy" `
+    --command-line "python iot_device_simulator.py --mode multi --config simulator_config.json --interval $SendInterval --count $MessageCount" `
     --output none
 
 Write-Host ""

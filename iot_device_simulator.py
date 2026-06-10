@@ -29,17 +29,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ============================================================================
-# CONFIG - IoT Hub 连接方式 (三选一, 按优先级)
+# CONFIG - IoT Hub 连接方式
 # ============================================================================
-# 方式1: 设备连接字符串 (单设备模式)
-#   设置环境变量: IOTHUB_DEVICE_CONNECTION_STRING
-#   格式: HostName=<hub>.azure-devices.net;DeviceId=<id>;SharedAccessKey=<key>
+# 单设备模式 (--mode single):
+#   方式1: 设备连接字符串
+#     设置环境变量: IOTHUB_DEVICE_CONNECTION_STRING
+#     格式: HostName=<hub>.azure-devices.cn;DeviceId=<id>;SharedAccessKey=<key>  (中国云 .cn)
 #
-# 方式2: DPS 对称密钥 (多设备模式, 自动注册)
-#   设置环境变量: DPS_ID_SCOPE, DPS_SYMMETRIC_KEY, DPS_REGISTRATION_ID
-#
-# 方式3: IoT Hub 连接字符串 + 设备 ID (用 IoT Hub SDK 创建设备)
-#   设置环境变量: IOTHUB_CONNECTION_STRING
+# 多设备模式 (--mode multi --config simulator_config.json):
+#   方式A (推荐): DPS + 对称密钥 Enrollment Group (配置文件含 "dps" 段)
+#     每个组的 id_scope 与组主密钥通过环境变量传入, 切勿写入配置文件/提交 git:
+#       $env:DPS_IDSCOPE_SENSORS = '0ne00XXXXXX'
+#       $env:DPS_GROUPKEY_SENSORS = '<组主密钥base64>'
+#       $env:DPS_IDSCOPE_ENERGY  = '0ne00YYYYYY'
+#       $env:DPS_GROUPKEY_ENERGY  = '<组主密钥base64>'
+#     模拟器按 registration_id (=device_id) 派生每台设备专属密钥后向 DPS 注册。
+#   方式B (兼容旧版): 配置文件含 iothub_connection_string (iothubowner) 自动注册。
 # ============================================================================
 
 
@@ -495,12 +500,38 @@ DEFAULT_DEVICES = [
 # IoT Hub 发送逻辑
 # ============================================================================
 
-class IoTHubSender:
-    """Azure IoT Hub 消息发送器"""
+def derive_device_key(group_master_key_b64: str, registration_id: str) -> str:
+    """由 Enrollment Group 组主密钥派生设备专属密钥
 
-    def __init__(self, connection_string):
+    derivedKey = Base64( HMAC-SHA256( Base64Decode(groupMasterKey), registrationId ) )
+
+    注意: 组主密钥只应存在于后台/产线, 切勿下发到真实设备。此函数仅供模拟器
+    在测试环境中临时派生使用。
+    """
+    import base64
+    import hmac
+    import hashlib
+
+    master = base64.b64decode(group_master_key_b64)
+    signature = hmac.new(master, registration_id.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def _apply_message_props(msg, message_props):
+    """把元数据写入消息的自定义属性 (可用于 IoT Hub 路由/过滤)"""
+    if not message_props:
+        return
+    for key, value in message_props.items():
+        msg.custom_properties[key] = str(value)
+
+
+class IoTHubSender:
+    """Azure IoT Hub 消息发送器 (设备连接字符串方式)"""
+
+    def __init__(self, connection_string, message_props=None):
         from azure.iot.device import IoTHubDeviceClient, Message
         self._Message = Message
+        self._message_props = message_props or {}
         self.client = IoTHubDeviceClient.create_from_connection_string(connection_string)
         self.client.connect()
         print(f"[IoTHub] Connected successfully")
@@ -510,6 +541,67 @@ class IoTHubSender:
         msg = self._Message(payload)
         msg.content_type = "application/json"
         msg.content_encoding = "utf-8"
+        _apply_message_props(msg, self._message_props)
+        self.client.send_message(msg)
+
+    def close(self):
+        self.client.disconnect()
+
+
+class DpsSymmetricKeySender:
+    """DPS 对称密钥 (Enrollment Group) 方式的设备发送器
+
+    模拟真实设备端行为:
+      1. 用 registration_id + 派生密钥向 DPS 注册 (provision)
+      2. 用 DPS 分配的 IoT Hub + 同一派生密钥连接
+      3. 用 reported 属性上报设备元数据 (deviceType/site/tags 等)
+      4. 每条遥测带上自定义消息属性, 便于路由
+
+    设备端不持有组主密钥, 只使用预先派生/下发的 derived_key。
+    """
+
+    def __init__(self, provisioning_host, id_scope, registration_id, derived_key,
+                 reported_props=None, message_props=None):
+        from azure.iot.device import IoTHubDeviceClient, Message, ProvisioningDeviceClient
+        self._Message = Message
+        self._message_props = message_props or {}
+
+        # 1) 向 DPS 注册
+        prov_client = ProvisioningDeviceClient.create_from_symmetric_key(
+            provisioning_host=provisioning_host,
+            registration_id=registration_id,
+            id_scope=id_scope,
+            symmetric_key=derived_key,
+        )
+        result = prov_client.register()
+        if result.status != "assigned":
+            raise RuntimeError(f"DPS 注册失败 (status={result.status})")
+
+        assigned_hub = result.registration_state.assigned_hub
+        device_id = result.registration_state.device_id
+        print(f"[DPS] {registration_id} -> assigned hub={assigned_hub}, device_id={device_id}")
+
+        # 2) 用分配的 Hub 连接
+        self.client = IoTHubDeviceClient.create_from_symmetric_key(
+            symmetric_key=derived_key,
+            hostname=assigned_hub,
+            device_id=device_id,
+        )
+        self.client.connect()
+
+        # 3) 上报设备元数据到 device twin (reported properties)
+        if reported_props:
+            try:
+                self.client.patch_twin_reported_properties(dict(reported_props))
+            except Exception as e:
+                print(f"[DPS] {device_id} 上报 twin 属性失败 (忽略): {e}")
+
+    def send(self, payload_dict):
+        payload = json.dumps(payload_dict, ensure_ascii=False)
+        msg = self._Message(payload)
+        msg.content_type = "application/json"
+        msg.content_encoding = "utf-8"
+        _apply_message_props(msg, self._message_props)
         self.client.send_message(msg)
 
     def close(self):
@@ -531,23 +623,37 @@ class DryRunSender:
 # ============================================================================
 
 CONFIG_TEMPLATE = """{
-  "iothub_connection_string": "HostName=<your-hub>.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=<key>",
   "send_interval_seconds": 10,
   "message_count": 0,
+  "dps": {
+    "provisioning_host": "global.azure-devices-provisioning.cn",
+    "enrollment_groups": {
+      "sensors-group": {
+        "id_scope_env": "DPS_IDSCOPE_SENSORS",
+        "group_master_key_env": "DPS_GROUPKEY_SENSORS",
+        "initial_twin_tags": {"site": "shanghai-plant-01", "environment": "prod", "firmwareTrack": "stable"}
+      },
+      "energy-group": {
+        "id_scope_env": "DPS_IDSCOPE_ENERGY",
+        "group_master_key_env": "DPS_GROUPKEY_ENERGY",
+        "initial_twin_tags": {"site": "shanghai-plant-02", "environment": "prod", "firmwareTrack": "canary"}
+      }
+    }
+  },
   "devices": [
-    {"device_id": "device-wsd-01", "device_type": "temperature_humidity"},
-    {"device_id": "device-wsd-02", "device_type": "temperature_humidity"},
-    {"device_id": "device-wsd-03", "device_type": "temperature_humidity"},
-    {"device_id": "device-wsd-04", "device_type": "temperature_humidity"},
-    {"device_id": "device-cn-01",  "device_type": "energy_storage"},
-    {"device_id": "my-device-6",   "device_type": "power_meter"},
-    {"device_id": "my-device-3",   "device_type": "solar_panel"},
-    {"device_id": "my-device-28",  "device_type": "boiler"},
-    {"device_id": "my-device-16",  "device_type": "chiller"},
-    {"device_id": "my-device-55",  "device_type": "compressed_air"},
-    {"device_id": "my-device-77",  "device_type": "substation_meter"},
-    {"device_id": "my-device-19",  "device_type": "gas_flow"},
-    {"device_id": "my-device-65",  "device_type": "water_meter"}
+    {"device_id": "device-wsd-01", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L1", "criticality": "normal"}},
+    {"device_id": "device-wsd-02", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L1", "criticality": "normal"}},
+    {"device_id": "device-wsd-03", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L2", "criticality": "normal"}},
+    {"device_id": "device-wsd-04", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L2", "criticality": "normal"}},
+    {"device_id": "my-device-19", "device_type": "gas_flow", "group": "sensors-group", "tags": {"line": "L3", "criticality": "high"}},
+    {"device_id": "my-device-65", "device_type": "water_meter", "group": "sensors-group", "tags": {"line": "L3", "criticality": "normal"}},
+    {"device_id": "device-cn-01", "device_type": "energy_storage", "group": "energy-group", "tags": {"line": "P1", "criticality": "high"}},
+    {"device_id": "my-device-6", "device_type": "power_meter", "group": "energy-group", "tags": {"line": "P1", "criticality": "high"}},
+    {"device_id": "my-device-3", "device_type": "solar_panel", "group": "energy-group", "tags": {"line": "P2", "criticality": "normal"}},
+    {"device_id": "my-device-28", "device_type": "boiler", "group": "energy-group", "tags": {"line": "P2", "criticality": "high"}},
+    {"device_id": "my-device-16", "device_type": "chiller", "group": "energy-group", "tags": {"line": "P3", "criticality": "high"}},
+    {"device_id": "my-device-55", "device_type": "compressed_air", "group": "energy-group", "tags": {"line": "P3", "criticality": "normal"}},
+    {"device_id": "my-device-77", "device_type": "substation_meter", "group": "energy-group", "tags": {"line": "P4", "criticality": "high"}}
   ]
 }
 """
@@ -768,44 +874,94 @@ def main():
 
     elif args.mode == "multi":
         # ------ 多设备模式 ------
-        # 优先从配置文件读取; 否则使用默认设备列表
-        if args.config:
-            config = load_config(args.config)
-            iothub_conn_str = config.get("iothub_connection_string", "")
-            interval = config.get("send_interval_seconds", args.interval)
-            count = config.get("message_count", args.count)
-            devices_config = [
-                (d["device_id"], TYPE_MAP[d["device_type"]])
-                for d in config["devices"]
-                if d["device_type"] in TYPE_MAP
-            ]
-        else:
-            iothub_conn_str = args.connection_string or os.environ.get("IOTHUB_CONNECTION_STRING", "")
-            interval = args.interval
-            count = args.count
-            devices_config = DEFAULT_DEVICES
+        if not args.config:
+            print("错误: 多设备模式需要配置文件 (--config)")
+            print(f"  python {sys.argv[0]} --init-config   # 生成模板")
+            print(f"  python {sys.argv[0]} --mode multi --config simulator_config.json")
+            sys.exit(1)
+
+        config = load_config(args.config)
+        interval = config.get("send_interval_seconds", args.interval)
+        count = config.get("message_count", args.count)
+        devices_config = [
+            (d["device_id"], TYPE_MAP[d["device_type"]])
+            for d in config["devices"]
+            if d["device_type"] in TYPE_MAP
+        ]
+
+        # 预先构造每个设备的元数据 (tags / reported props / 消息属性)
+        device_meta = {}
+        for d in config["devices"]:
+            if d["device_type"] not in TYPE_MAP:
+                continue
+            props = {"deviceType": d["device_type"]}
+            group_name = d.get("group")
+            if "dps" in config and group_name:
+                group = config["dps"]["enrollment_groups"][group_name]
+                props.update(group.get("initial_twin_tags", {}))
+                props["enrollmentGroup"] = group_name
+            props.update(d.get("tags", {}))
+            device_meta[d["device_id"]] = props
 
         if args.dry_run:
             def sender_factory(device_id):
+                meta = device_meta.get(device_id, {})
+                print(f"[{device_id}] DRY-RUN metadata/tags: {json.dumps(meta, ensure_ascii=False)}")
                 return DryRunSender()
+
+        elif "dps" in config:
+            # ------ DPS 对称密钥 (Enrollment Group) 方式 ------
+            dps_cfg = config["dps"]
+            prov_host = dps_cfg.get("provisioning_host", "global.azure-devices-provisioning.cn")
+            groups = dps_cfg["enrollment_groups"]
+
+            # 解析每个组的 id_scope 和组主密钥 (来自环境变量, 不入库)
+            resolved_groups = {}
+            for gname, g in groups.items():
+                id_scope = os.environ.get(g["id_scope_env"], "")
+                master_key = os.environ.get(g["group_master_key_env"], "")
+                if not id_scope or not master_key:
+                    print(f"错误: 组 '{gname}' 缺少环境变量")
+                    print(f"  请设置 {g['id_scope_env']} 和 {g['group_master_key_env']}")
+                    print()
+                    print("示例 (PowerShell):")
+                    print(f"  $env:{g['id_scope_env']} = '0ne00XXXXXX'")
+                    print(f"  $env:{g['group_master_key_env']} = '<组主密钥base64>'")
+                    print()
+                    print("提示: 组主密钥仅用于模拟器本地派生设备密钥, 切勿写入配置文件或提交到 git")
+                    sys.exit(1)
+                resolved_groups[gname] = (id_scope, master_key)
+
+            # 为每个设备派生专属密钥
+            device_dps = {}
+            for d in config["devices"]:
+                if d["device_type"] not in TYPE_MAP:
+                    continue
+                gname = d["group"]
+                id_scope, master_key = resolved_groups[gname]
+                derived = derive_device_key(master_key, d["device_id"])
+                device_dps[d["device_id"]] = (id_scope, derived)
+
+            print(f"[DPS] 通过 {len(resolved_groups)} 个 Enrollment Group 注册 "
+                  f"{len(device_dps)} 个设备 (host={prov_host})\n")
+
+            def sender_factory(device_id):
+                id_scope, derived = device_dps[device_id]
+                props = device_meta.get(device_id, {})
+                return DpsSymmetricKeySender(
+                    prov_host, id_scope, device_id, derived,
+                    reported_props=props, message_props=props,
+                )
+
         else:
+            # ------ 兼容旧方式: IoT Hub 服务连接字符串自动注册 ------
+            iothub_conn_str = config.get("iothub_connection_string", "") \
+                or args.connection_string or os.environ.get("IOTHUB_CONNECTION_STRING", "")
             if not iothub_conn_str:
-                print("错误: 多设备模式需要 IoT Hub 服务连接字符串")
-                print()
-                print("方式1 - 使用配置文件:")
-                print(f"  python {sys.argv[0]} --init-config")
-                print(f"  # 编辑 simulator_config.json 填入连接字符串")
-                print(f"  python {sys.argv[0]} --mode multi --config simulator_config.json")
-                print()
-                print("方式2 - 环境变量:")
-                print("  set IOTHUB_CONNECTION_STRING=HostName=xxx;SharedAccessKeyName=iothubowner;SharedAccessKey=xxx")
-                print(f"  python {sys.argv[0]} --mode multi")
-                print()
-                print("方式3 - 先用 dry-run 验证:")
-                print(f"  python {sys.argv[0]} --mode multi --dry-run --count 2")
+                print("错误: 配置文件无 'dps' 段, 也未提供 IoT Hub 服务连接字符串")
+                print(f"  先用 dry-run 验证: python {sys.argv[0]} --mode multi --config {args.config} --dry-run --count 2")
                 sys.exit(1)
 
-            # 自动注册设备并获取设备连接字符串
             device_ids = [did for did, _ in devices_config]
             print(f"[Provisioning] Registering {len(device_ids)} devices on IoT Hub...")
             try:
@@ -825,7 +981,7 @@ def main():
                 if not conn:
                     print(f"[{device_id}] Warning: 无连接字符串, 跳过")
                     return DryRunSender()
-                return IoTHubSender(conn)
+                return IoTHubSender(conn, message_props=device_meta.get(device_id))
 
         run_multi_device(devices_config, sender_factory, interval, count, args.dry_run)
 

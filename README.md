@@ -2,6 +2,8 @@
 
 ## 一、整体架构
 
+### 1.1 数据流总览
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  iot_device_simulator.py (本地运行)                          │
@@ -15,7 +17,12 @@
 └─────────────────────────┼───────────────────────────────────┘
                           ▼
                  ┌─────────────────┐
-                 │  Azure IoT Hub  │  ← 自动注册设备 (Service SDK)
+                 │   Azure DPS     │  ← 设备经对称密钥组自动注册
+                 └────────┬────────┘
+                          │ (分配 IoT Hub)
+                          ▼
+                 ┌─────────────────┐
+                 │  Azure IoT Hub  │
                  └────────┬────────┘
                           │ (消息路由)
                           ▼
@@ -34,18 +41,89 @@
                  └─────────────────┘
 ```
 
+### 1.2 组件职责与选型
+
+| 层 | 组件 | 职责 | 选型要点 |
+|---|---|---|---|
+| 设备/采集 | 模拟器 (本地 / ACI 容器) | 模拟 13 台工业设备，DPS 注册后发送遥测 | 生产环境替换为真实设备或边缘网关 (IoT Edge) |
+| 注册 | **Azure DPS** | 对称密钥 Enrollment Group，零接触自动注册并分配 Hub | 量产首选，避免分发高权限凭据 |
+| 接入 | **Azure IoT Hub** | 设备身份、双向通信、消息路由、Device Twin | 层级按消息量选 (测试 F1，生产 S1/S2/S3) |
+| 缓冲 | **Event Hub** | 高吞吐消息缓冲，解耦上下游 | 可直接用 IoT Hub 内置兼容端点；高并发或多消费组时另建 |
+| 存储 | **Storage + ADLS Gen2** | 冷/温数据湖存储 (Avro/Parquet) | 启用分层命名空间 (HNS)，配合 Event Hub Capture |
+| 分析 | **Databricks** | 流/批处理、特征工程、建模 | 按需用 Auto Loader 增量摄取 ADLS |
+
+### 1.3 网络设计（尽量走内网）
+为减少公网暴露面，建议将平台资源放入同一 VNet。**注意区分两类连接**：
+
+- **客户端 → 服务（经 Private Endpoint 走内网）**：由 VNet 内的计算（ACI、Databricks）主动发起的访问，可经私有终结点进入服务。
+- **服务 → 服务（PaaS 后端，走 Microsoft 骨干，不经 PE）**：IoT Hub、Event Hub 等 PaaS **没有 VNet 出站能力**，它们之间的投递（IoT Hub 路由 → Event Hub、Event Hub Capture → ADLS）走 Azure 内部骨干网，**不会也无法穿过客户的 Private Endpoint**。这类目标若关闭公网，需用「**允许受信任的 Microsoft 服务**」防火墙例外 + **托管标识**放行，而不是建 PE。
+
+Azure 中国云完整支持 Private Link 与上述受信任服务例外。
+
+```mermaid
+flowchart TB
+    subgraph VNet["VNet 10.10.0.0/16 (China North 3)"]
+        subgraph SubACI["subnet-aci 10.10.1.0/24 (委派 ACI)"]
+            SIM["模拟器容器 (ACI VNet 注入)"]
+        end
+        subgraph SubPE["subnet-pe 10.10.2.0/24 (Private Endpoints)"]
+            PE_DPS["PE: DPS"]
+            PE_HUB["PE: IoT Hub"]
+            PE_ST["PE: Storage/ADLS"]
+            PE_ACR["PE: ACR"]
+        end
+        subgraph SubDBX["subnet-dbx (Databricks VNet 注入)"]
+            DBX["Databricks 集群"]
+        end
+        DNS["Private DNS Zones"]
+    end
+    SIM -->|内网/PE| PE_DPS --> DPS[(DPS)]
+    SIM -->|内网/PE| PE_HUB --> HUB[(IoT Hub)]
+    SIM -->|拉取镜像/PE| PE_ACR --> ACR[(ACR)]
+    HUB -.受信任服务+托管标识<br/>骨干网, 非PE.-> EH[(Event Hub)]
+    EH -.Capture 受信任服务<br/>骨干网, 非PE.-> ST[(ADLS Gen2)]
+    DBX -->|内网/PE| PE_ST --> ST
+    DNS -.解析.- PE_DPS & PE_HUB & PE_ST & PE_ACR
+```
+
+**关键设计原则**
+
+| 项 | 建议 |
+|---|---|
+| VNet 规划 | 单 VNet 多子网：`subnet-aci`(委派 `Microsoft.ContainerInstance/containerGroups`)、`subnet-pe`(Private Endpoint)、`subnet-dbx`(Databricks 注入需 host/container 两个子网) |
+| 客户端经 PE 接入 | **DPS、IoT Hub、ACR** 供 ACI 访问，**Storage/ADLS** 供 Databricks 访问 → 这些建 Private Endpoint，并**关闭公网访问** |
+| 服务到服务（不建 PE） | **IoT Hub 路由 → Event Hub**、**Event Hub Capture → ADLS** 走骨干网；目标关闭公网时启用「允许受信任的 Microsoft 服务绕过防火墙」+ 托管标识，**无需为 Event Hub 建 PE**，ADLS 的 PE 仅服务于 Databricks 读取 |
+| 私有 DNS | 为每个建了 PE 的服务建对应 Private DNS Zone 并链接 VNet（见下表） |
+| 出站控制 | ACI 子网经 NAT Gateway 或防火墙统一出站；仅放行 `az login`/镜像构建等必要流量 |
+| 凭据 | 组主密钥、连接串通过安全环境变量 / Key Vault (启用 PE) 注入，禁止入库入镜像 |
+
+> **Event Hub 是否需要 PE？** 仅当 VNet 内有自定义消费者（如某个内网服务直接读 Event Hub）时才需要。本架构中 Event Hub 的下游是 Capture（服务到服务），上游是 IoT Hub 路由（服务到服务），两端都不经 PE，因此**默认不为 Event Hub 建 PE**。
+
+**中国云 Private DNS Zone 名称**
+
+| 服务 | Private DNS Zone | 本架构是否需要 PE |
+|---|---|---|
+| IoT Hub | `privatelink.azure-devices.cn` | 需要（ACI 访问） |
+| DPS | `privatelink.azure-devices-provisioning.cn` | 需要（ACI 访问） |
+| Event Hub | `privatelink.servicebus.chinacloudapi.cn` | 默认不需要（仅服务到服务） |
+| Blob / ADLS | `privatelink.blob.core.chinacloudapi.cn` / `privatelink.dfs.core.chinacloudapi.cn` | 需要（Databricks 访问） |
+| ACR | `privatelink.azurecr.cn` | 需要（ACI 拉镜像） |
+| Key Vault | `privatelink.vaultcore.azure.cn` | 推荐（凭据托管） |
+
+> **测试 vs 生产**：F1 免费版 IoT Hub 与 ACI 公网部署适合快速验证（本手册默认路径）。生产环境建议按上表收敛到内网，并把模拟器替换为真实设备 / IoT Edge 网关。设备若在工厂现场，通过专线 (ExpressRoute) 或 VPN 接入 VNet，再经私有终结点访问 IoT Hub。
+
 ## 二、环境准备
 
 ### 2.1 Python 依赖安装
 
 ```powershell
-pip install azure-iot-device azure-iot-hub
+pip install azure-iot-device
 ```
 
 | 包名 | 用途 | 最低版本 |
 |---|---|---|
-| `azure-iot-device` | 设备端 SDK，模拟设备发送遥测 | 2.12+ |
-| `azure-iot-hub` | 服务端 SDK，自动注册/管理设备 | 2.6+ |
+| `azure-iot-device` | 设备端 SDK，DPS 注册 + 模拟设备发送遥测 | 2.12+ |
+| `azure-iot-hub` | (仅兼容旧版 iothubowner 自动注册路径需要) | 2.6+ |
 
 ### 2.2 Azure 资源准备
 
@@ -54,23 +132,219 @@ pip install azure-iot-device azure-iot-hub
 | 资源 | 说明 |
 |---|---|
 | **IoT Hub** | 任意层级 (F1 免费版即可测试, 每天 8000 条消息) |
+| **DPS (Device Provisioning Service)** | 设备注册入口, 链接到 IoT Hub (详见 §2.3) |
 | **Event Hub** (可选) | IoT Hub 内置兼容端点已包含 Event Hub；如需自定义路由则另建 |
 | **Storage Account + ADLS Gen2** (可选) | 配合 Event Hub Capture 使用 |
 
-### 2.3 获取 IoT Hub 连接字符串
+### 2.3 IoT Hub + DPS 端配置详解
 
-这是多设备模式的**唯一必要凭据**，脚本会自动用它注册所有设备。
+多设备模式使用 **DPS + 对称密钥 Enrollment Group** 注册设备（更贴近真实量产场景，无需分发 iothubowner 高权限密钥）。下面给出 Azure **中国云**（China North 3）的完整配置步骤，含 Portal 与 Azure CLI 两种方式。
 
-```
-Azure Portal → IoT Hub → 共享访问策略 → iothubowner → 主连接字符串
+> 前置：CLI 操作前先登录中国云。
+> ```powershell
+> az cloud set --name AzureChinaCloud
+> az login
+> az account set --subscription "<你的订阅ID>"
+> ```
+
+#### 步骤 ① 创建 IoT Hub
+
+**Portal**：Azure Portal（portal.azure.cn）→ 创建资源 → IoT Hub → 选择资源组、区域（China North 3 等）、名称与层级（测试可用 F1）。
+
+**CLI**：
+```powershell
+az iot hub create `
+  --name <your-hub> `
+  --resource-group <rg> `
+  --location chinanorth3 `
+  --sku S1
 ```
 
-格式：
-```
-HostName=<your-hub>.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=<base64-key>
+> 中国云 IoT Hub 主机名形如 `<your-hub>.azure-devices.cn`。
+
+#### 步骤 ② 创建 DPS 实例
+
+**Portal**：创建资源 → IoT Hub Device Provisioning Service → 同一资源组/区域、命名。
+
+**CLI**：
+```powershell
+az iot dps create `
+  --name <your-dps> `
+  --resource-group <rg> `
+  --location chinanorth3
 ```
 
-> **安全提示**: `iothubowner` 拥有全部权限。生产环境应使用 `registryReadWrite` + `serviceConnect` 策略，或使用 DPS。
+#### 步骤 ③ 把 DPS 链接到 IoT Hub
+
+DPS 注册成功后要把设备分配到哪个 Hub，需先建立链接。
+
+**Portal**：DPS → 设置 → 链接的 IoT 中心 → 添加 → 选择目标 IoT Hub（使用 iothubowner 访问策略）。
+
+**CLI**：
+```powershell
+# 取 IoT Hub 连接字符串 (仅本步链接用, 设备运行不需要)
+$hubConn = az iot hub connection-string show `
+  --hub-name <your-hub> --policy-name iothubowner --query connectionString -o tsv
+
+az iot dps linked-hub create `
+  --dps-name <your-dps> `
+  --resource-group <rg> `
+  --connection-string $hubConn `
+  --location chinanorth3
+```
+
+#### 步骤 ④ 记录 DPS 的 ID Scope
+
+**Portal**：DPS → 概览 → **ID Scope**（形如 `0ne00XXXXXX`）。
+
+**CLI**：
+```powershell
+az iot dps show --name <your-dps> --resource-group <rg> --query properties.idScope -o tsv
+```
+
+> 本项目用了两个组（`sensors-group`、`energy-group`）。它们**可以在同一个 DPS**（共用同一 ID Scope），也可以分属两个 DPS（各自 ID Scope）。配置文件通过 `DPS_IDSCOPE_SENSORS` / `DPS_IDSCOPE_ENERGY` 两个环境变量分别指定，同 DPS 时填相同值即可。
+
+#### 步骤 ⑤ 创建两个对称密钥 Enrollment Group
+
+**Portal**：DPS → Manage enrollments → **Enrollment groups** → + Add：
+- **Group name**：`sensors-group`（再建一个 `energy-group`）
+- **Attestation type**：**Symmetric Key**
+- **Auto-generate keys**：勾选（DPS 生成组主密钥）
+- **Select how you want to assign devices to hubs**：选目标 IoT Hub 与分配策略（如 Evenly weighted）
+- **Initial Device Twin（可选）**：可在此预置组级 tags（模拟器也会在运行时上报，二选一或叠加）
+
+**CLI**：
+```powershell
+az iot dps enrollment-group create `
+  --dps-name <your-dps> --resource-group <rg> `
+  --enrollment-id sensors-group
+
+az iot dps enrollment-group create `
+  --dps-name <your-dps> --resource-group <rg> `
+  --enrollment-id energy-group
+```
+
+#### 步骤 ⑥ 获取每个组的组主密钥（Primary Key）
+
+**Portal**：DPS → Enrollment groups → 选择组 → **Primary Key**（base64 字符串）。
+
+**CLI**：
+```powershell
+az iot dps enrollment-group show `
+  --dps-name <your-dps> --resource-group <rg> `
+  --enrollment-id sensors-group `
+  --query "attestation.symmetricKey.primaryKey" -o tsv
+
+az iot dps enrollment-group show `
+  --dps-name <your-dps> --resource-group <rg> `
+  --enrollment-id energy-group `
+  --query "attestation.symmetricKey.primaryKey" -o tsv
+```
+
+#### 步骤 ⑦ 把 ID Scope 与组主密钥配置给模拟器
+
+通过环境变量传入（详见 §3 步骤 2），**切勿写入配置文件或提交 git**：
+```powershell
+$env:DPS_IDSCOPE_SENSORS  = '0ne00XXXXXX'
+$env:DPS_GROUPKEY_SENSORS = '<sensors 组 Primary Key>'
+$env:DPS_IDSCOPE_ENERGY   = '0ne00XXXXXX'   # 同一 DPS 则与上面相同
+$env:DPS_GROUPKEY_ENERGY  = '<energy 组 Primary Key>'
+```
+
+#### 配置关系总览
+
+```mermaid
+flowchart TD
+    HUB[(IoT Hub<br/>*.azure-devices.cn)] -->|③ Linked Hub| DPS[DPS<br/>ID Scope 0ne00XXXXXX]
+    DPS --> G1[Enrollment Group<br/>sensors-group + 组主密钥]
+    DPS --> G2[Enrollment Group<br/>energy-group + 组主密钥]
+    G1 -->|⑦ 环境变量| SIM[模拟器]
+    G2 -->|⑦ 环境变量| SIM
+    SIM -->|派生密钥 + DPS 注册| HUB
+```
+
+#### 验证（设备注册后）
+
+设备首次注册成功后，可查看每个组实际注册进来的设备：
+```powershell
+az iot dps enrollment-group registration-state list `
+  --dps-name <your-dps> --resource-group <rg> `
+  --enrollment-id sensors-group -o table
+
+# IoT Hub 侧确认设备已自动创建
+az iot hub device-identity list --hub-name <your-hub> -o table
+```
+
+> **安全提示**: 组主密钥是最高敏感凭据，只通过环境变量传入模拟器，**切勿写入配置文件或提交到 git**。设备端不持有组主密钥，模拟器按 `registration_id`(=device_id) 派生每台设备的专属密钥。iothubowner 仅在上面 ③ 链接 DPS 时使用一次，设备运行阶段完全不需要。
+
+### 2.4 其他 Azure 资源部署建议（IoT Hub 之外）
+
+下游数据平台资源按需部署。以下给出推荐配置、中国云 CLI 命令与内网化要点。
+
+#### 2.4.1 Event Hub（消息缓冲）
+
+- **何时需要**：默认可直接用 IoT Hub 的**内置兼容端点**（已是 Event Hub 协议），无需单独创建；当需要独立消费组、更高吞吐、或把多源数据汇聚时再建独立 Event Hub，并在 IoT Hub 配置**自定义路由**指向它。
+- **选型**：命名空间 Standard（支持 20 消费组、Capture）；分区数按峰值吞吐与并行消费者估算（一个分区约 1 MB/s 入），分区数创建后不可减少，宜适度预留。
+- **内网**：IoT Hub 路由属**服务到服务**投递（走骨干网，非 PE）。Event Hub 关闭公网时，启用「允许受信任的 Microsoft 服务绕过防火墙」并用**托管标识**作为 IoT Hub 路由终结点凭据即可，**默认无需为 Event Hub 建 Private Endpoint**；仅当 VNet 内有自定义消费者直接读取时才建 PE（`privatelink.servicebus.chinacloudapi.cn`）。
+
+```powershell
+az eventhubs namespace create -g <rg> -n <ehns> -l chinanorth3 --sku Standard
+az eventhubs eventhub create -g <rg> --namespace-name <ehns> -n telemetry `
+  --partition-count 4 --message-retention 1
+# IoT Hub 自定义路由（可选）：先建 Event Hub 终结点再加路由规则
+```
+
+#### 2.4.2 Storage Account + ADLS Gen2（数据湖）
+
+- **必须启用分层命名空间 (HNS)** 才是 ADLS Gen2；冗余测试用 LRS，生产可 ZRS/GRS。
+- 配合 **Event Hub Capture** 自动把流数据落为 Avro，或用 Databricks Auto Loader 增量摄取。
+- **内网**：**Event Hub Capture → ADLS 是服务到服务**写入（走骨干网，非 PE）。存储关闭公网时，启用「允许受信任的 Microsoft 服务绕过防火墙」即可放行 Capture。存储的 **Private Endpoint 主要服务于 Databricks 的内网读取**：为 `blob` 与 `dfs` 两个子资源各建 PE，分别链接 `privatelink.blob.*` 与 `privatelink.dfs.*`。
+
+```powershell
+az storage account create -g <rg> -n <stacct> -l chinanorth3 `
+  --sku Standard_LRS --kind StorageV2 --hierarchical-namespace true
+az storage container create --account-name <stacct> -n raw --auth-mode login
+```
+
+#### 2.4.3 容器与镜像（ACR + ACI）
+
+- **ACR**：存放模拟器镜像；生产建议 Premium SKU（支持 Private Endpoint、内容信任、geo 复制），测试 Basic 即可。`deploy-to-azure.ps1` 会自动创建。
+- **ACI**：运行模拟器；内网部署时用 `--vnet`/`--subnet` 把容器组注入委派子网，经私有终结点访问 IoT Hub/DPS/ACR。
+- 详见 §九 的一键 / 分步部署。
+
+```powershell
+# 内网 ACI 示例（在已委派的子网中运行）
+az container create -g <rg> --name iot-simulator `
+  --image <acr>.azurecr.cn/iot-device-simulator:latest `
+  --vnet <vnet> --subnet subnet-aci `
+  --cpu 0.5 --memory 0.5 --restart-policy Always
+```
+
+#### 2.4.4 Databricks（分析）
+
+- **VNet 注入**：创建工作区时选「Deploy to your own VNet」，提供 host/container 两个专用子网，使集群在你的网络内，经私有终结点访问 ADLS。
+- 用 **Unity Catalog + Auto Loader** 增量读取 `raw` 容器，避免全量扫描。
+- 通过 **Access Connector / 托管标识** 访问存储，免密钥。
+
+#### 2.4.5 Key Vault（凭据托管，推荐）
+
+- 把 DPS 组主密钥、连接串存入 Key Vault，ACI/Databricks 经托管标识读取，替代明文环境变量。
+- 启用 Private Endpoint（`privatelink.vaultcore.azure.cn`）并关闭公网访问。
+
+```powershell
+az keyvault create -g <rg> -n <kv> -l chinanorth3 --enable-rbac-authorization true
+az keyvault secret set --vault-name <kv> -n DPS-GROUPKEY-SENSORS --value "<密钥>"
+```
+
+#### 部署顺序建议
+
+1. 资源组 + VNet/子网 + Private DNS Zones
+2. IoT Hub + DPS + Enrollment Groups（§2.3）
+3. （可选）Event Hub / Storage(ADLS) / Key Vault + 各自 Private Endpoint
+4. ACR + 构建镜像 + ACI 部署模拟器（§九）
+5. Databricks 工作区接入 ADLS 做分析
+
+> 测试阶段可跳过 3/5 与全部内网化，仅用 IoT Hub + ACI 即可跑通端到端（§三、§九）。
 
 ---
 
@@ -83,32 +357,48 @@ cd C:\Users\JieYin\Downloads\iot_simulator
 python iot_device_simulator.py --init-config
 ```
 
-生成 `simulator_config.json`：
+生成 `simulator_config.json`（DPS 对称密钥 Enrollment Group 方式）：
 
 ```json
 {
-  "iothub_connection_string": "HostName=<your-hub>.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=<key>",
   "send_interval_seconds": 10,
   "message_count": 0,
+  "dps": {
+    "provisioning_host": "global.azure-devices-provisioning.cn",
+    "enrollment_groups": {
+      "sensors-group": {
+        "id_scope_env": "DPS_IDSCOPE_SENSORS",
+        "group_master_key_env": "DPS_GROUPKEY_SENSORS",
+        "initial_twin_tags": {"site": "shanghai-plant-01", "environment": "prod", "firmwareTrack": "stable"}
+      },
+      "energy-group": {
+        "id_scope_env": "DPS_IDSCOPE_ENERGY",
+        "group_master_key_env": "DPS_GROUPKEY_ENERGY",
+        "initial_twin_tags": {"site": "shanghai-plant-02", "environment": "prod", "firmwareTrack": "canary"}
+      }
+    }
+  },
   "devices": [
-    {"device_id": "device-wsd-01", "device_type": "temperature_humidity"},
-    {"device_id": "device-wsd-02", "device_type": "temperature_humidity"},
-    {"device_id": "device-cn-01",  "device_type": "energy_storage"},
-    {"device_id": "my-device-6",   "device_type": "power_meter"},
-    {"device_id": "my-device-3",   "device_type": "solar_panel"},
-    {"device_id": "my-device-28",  "device_type": "boiler"},
-    {"device_id": "my-device-16",  "device_type": "chiller"},
-    {"device_id": "my-device-55",  "device_type": "compressed_air"},
-    {"device_id": "my-device-77",  "device_type": "substation_meter"},
-    {"device_id": "my-device-19",  "device_type": "gas_flow"},
-    {"device_id": "my-device-65",  "device_type": "water_meter"}
+    {"device_id": "device-wsd-01", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L1", "criticality": "normal"}},
+    {"device_id": "my-device-6",   "device_type": "power_meter",         "group": "energy-group",  "tags": {"line": "P1", "criticality": "high"}}
   ]
 }
 ```
 
-### 步骤 2：填入 IoT Hub 连接字符串
+> 设备按 `group` 字段归属到两个 Enrollment Group：`sensors-group`（温湿度/燃气/水表）与 `energy-group`（电力/光伏/锅炉/冷机等）。每个组的 `initial_twin_tags` 模拟组级初始 twin 标签，设备级 `tags` 再叠加。
 
-编辑 `simulator_config.json`，将 `iothub_connection_string` 替换为真实值。
+### 步骤 2：通过环境变量提供 id_scope 与组主密钥
+
+组主密钥属于敏感凭据，**不写入配置文件、不提交 git**，改用环境变量传入：
+
+```powershell
+$env:DPS_IDSCOPE_SENSORS  = '0ne00XXXXXX'
+$env:DPS_GROUPKEY_SENSORS = '<sensors 组主密钥 base64>'
+$env:DPS_IDSCOPE_ENERGY   = '0ne00YYYYYY'
+$env:DPS_GROUPKEY_ENERGY  = '<energy 组主密钥 base64>'
+```
+
+> 组主密钥获取：Azure Portal → DPS → Manage enrollments → Enrollment groups → 选择组 → Primary Key。模拟器仅用它在本地为每台设备按 `registration_id`(=device_id) 派生专属密钥。
 
 ### 步骤 3：启动多设备模拟
 
@@ -116,11 +406,12 @@ python iot_device_simulator.py --init-config
 python iot_device_simulator.py --mode multi --config simulator_config.json
 ```
 
-脚本会自动完成：
-1. 在 IoT Hub 上注册所有设备（已存在则跳过）
-2. 获取每个设备的 SAS 密钥
-3. 为每个设备建立独立 MQTT 连接
-4. 按配置的间隔并发发送遥测数据
+脚本会自动完成（模拟真实设备端行为）：
+1. 为每台设备按 registration_id 派生对称密钥（HMAC-SHA256）
+2. 通过 DPS 注册，获取分配的 IoT Hub 与 device_id
+3. 用派生密钥连接分配到的 IoT Hub
+4. 上报设备元数据到 device twin（reported properties），并为每条遥测附带自定义消息属性（site/deviceType/criticality 等，可用于路由）
+5. 按配置的间隔并发发送遥测数据
 
 ---
 
@@ -130,9 +421,20 @@ python iot_device_simulator.py --mode multi --config simulator_config.json
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `iothub_connection_string` | string | IoT Hub 服务连接字符串 (含 `SharedAccessKeyName`) |
 | `send_interval_seconds` | number | 每个设备的发送间隔 (秒) |
 | `message_count` | number | 每个设备发送的消息总数 (0 = 无限循环) |
+| `dps.provisioning_host` | string | DPS 全局终结点 (Azure 中国云默认 `global.azure-devices-provisioning.cn`) |
+| `dps.enrollment_groups` | object | Enrollment Group 定义，键为组名 |
+
+每个 Enrollment Group 包含：
+
+| 字段 | 说明 |
+|---|---|
+| `id_scope_env` | 存放该组 ID Scope 的**环境变量名** |
+| `group_master_key_env` | 存放该组**组主密钥**的环境变量名（密钥本身不入库） |
+| `initial_twin_tags` | 组级初始 twin 标签 (site/environment/firmwareTrack 等) |
+
+> 兼容说明：若配置文件改为含 `iothub_connection_string`（iothubowner）而无 `dps` 段，则回退到旧版「IoT Hub 服务连接字符串自动注册」方式。
 
 ### 4.2 设备列表
 
@@ -140,8 +442,10 @@ python iot_device_simulator.py --mode multi --config simulator_config.json
 
 | 字段 | 说明 |
 |---|---|
-| `device_id` | 设备ID，将在 IoT Hub 上注册此 ID |
+| `device_id` | 设备ID，同时作为 DPS 注册的 registration_id |
 | `device_type` | 设备类型，决定生成的遥测数据格式 |
+| `group` | 所属 Enrollment Group 名称 (对应 `dps.enrollment_groups` 的键) |
+| `tags` | 设备级标签，叠加在组级 `initial_twin_tags` 之上 |
 
 ### 4.3 可用设备类型
 
@@ -160,14 +464,14 @@ python iot_device_simulator.py --mode multi --config simulator_config.json
 
 ### 4.4 自定义设备示例
 
-只需在 `devices` 数组中添加条目即可增加设备：
+只需在 `devices` 数组中添加条目即可增加设备（指定所属 `group` 与 `tags`）：
 
 ```json
 {
   "devices": [
-    {"device_id": "factory-A-wsd-01", "device_type": "temperature_humidity"},
-    {"device_id": "factory-A-wsd-02", "device_type": "temperature_humidity"},
-    {"device_id": "factory-A-boiler",  "device_type": "boiler"},
+    {"device_id": "factory-A-wsd-01", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L1", "criticality": "normal"}},
+    {"device_id": "factory-A-wsd-02", "device_type": "temperature_humidity", "group": "sensors-group", "tags": {"line": "L1", "criticality": "normal"}},
+    {"device_id": "factory-A-boiler",  "device_type": "boiler", "group": "energy-group", "tags": {"line": "P2", "criticality": "high"}},
     {"device_id": "factory-B-power",   "device_type": "power_meter"}
   ]
 }
@@ -180,8 +484,8 @@ python iot_device_simulator.py --mode multi --config simulator_config.json
 ### 5.1 Dry-Run 验证 (不连接 IoT Hub)
 
 ```powershell
-# 多设备 dry-run, 每设备发 2 条
-python iot_device_simulator.py --mode multi --dry-run --count 2 --interval 5
+# 多设备 dry-run (需配置文件), 每设备发 2 条
+python iot_device_simulator.py --mode multi --config simulator_config.json --dry-run --count 2 --interval 5
 
 # 使用配置文件 dry-run
 python iot_device_simulator.py --mode multi --config simulator_config.json --dry-run --count 1
@@ -205,12 +509,12 @@ python iot_device_simulator.py --device-id test-boiler-01 --device-type boiler -
 ### 5.3 多设备正式运行
 
 ```powershell
-# 方式 A: 配置文件 (推荐)
+# DPS 对称密钥 Enrollment Group 方式 (推荐)
+$env:DPS_IDSCOPE_SENSORS  = '0ne00XXXXXX'
+$env:DPS_GROUPKEY_SENSORS = '<sensors 组主密钥 base64>'
+$env:DPS_IDSCOPE_ENERGY   = '0ne00YYYYYY'
+$env:DPS_GROUPKEY_ENERGY  = '<energy 组主密钥 base64>'
 python iot_device_simulator.py --mode multi --config simulator_config.json
-
-# 方式 B: 环境变量
-$env:IOTHUB_CONNECTION_STRING = "HostName=xxx;SharedAccessKeyName=iothubowner;SharedAccessKey=xxx"
-python iot_device_simulator.py --mode multi --interval 15 --count 100
 ```
 
 ### 5.4 限量发送 (测试用)
@@ -287,19 +591,20 @@ df.select(
 
 建议测试时：设置 `--count 50 --interval 30` 控制消息量。
 
-### Q2: 报错 `ImportError: No module named 'azure.iot.hub'`
+### Q2: 报错 `ImportError: No module named 'azure.iot.device'`
 
 ```powershell
-pip install azure-iot-hub
+pip install azure-iot-device
 ```
 
-这个包只在多设备模式下需要（用于自动注册设备）。单设备模式只需 `azure-iot-device`。
+DPS 注册与设备发送均由 `azure-iot-device` 提供。`azure-iot-hub` 仅在兼容旧版 iothubowner 自动注册路径下才需要。
 
-### Q3: 报错 `Unauthorized`
+### Q3: DPS 注册报错 `Unauthorized` / `not assigned`
 
-检查连接字符串：
-- **多设备模式** 需要 **服务连接字符串** (含 `SharedAccessKeyName`)
-- **单设备模式** 需要 **设备连接字符串** (含 `DeviceId`)
+- 确认 `DPS_IDSCOPE_*` 与 `DPS_GROUPKEY_*` 环境变量已正确设置
+- 确认组主密钥取自对应的 Enrollment Group（sensors / energy 不要填反）
+- 确认 DPS 已**链接到目标 IoT Hub**（§2.3 步骤 ③）
+- 确认终结点为中国云 `global.azure-devices-provisioning.cn`
 
 ### Q4: 如何调整发送频率？
 
@@ -307,9 +612,9 @@ pip install azure-iot-hub
 - 命令行: `--interval 30` (30秒一次)
 - 建议: 测试用 5~10 秒, 模拟生产用 30~60 秒
 
-### Q5: 设备已存在但密钥不同怎么办？
+### Q5: 想重置某台设备重新注册怎么办？
 
-脚本会读取已有设备的密钥，不会覆盖。如需重置：
+删除 IoT Hub 中的设备记录，下次模拟器运行时 DPS 会重新创建：
 ```powershell
 az iot hub device-identity delete --hub-name <hub> --device-id <device-id>
 ```
@@ -343,7 +648,11 @@ python iot_device_simulator.py [选项]
 | 变量名 | 用途 |
 |---|---|
 | `IOTHUB_DEVICE_CONNECTION_STRING` | 单设备模式 - 设备连接字符串 |
-| `IOTHUB_CONNECTION_STRING` | 多设备模式 - 服务连接字符串 |
+| `DPS_IDSCOPE_SENSORS` | 多设备模式 - sensors-group 所属 DPS 的 ID Scope |
+| `DPS_GROUPKEY_SENSORS` | 多设备模式 - sensors-group 组主密钥 (base64) |
+| `DPS_IDSCOPE_ENERGY` | 多设备模式 - energy-group 所属 DPS 的 ID Scope |
+| `DPS_GROUPKEY_ENERGY` | 多设备模式 - energy-group 组主密钥 (base64) |
+| `IOTHUB_CONNECTION_STRING` | (兼容旧版) 多设备 - 配置文件无 `dps` 段时的 iothubowner 连接字符串 |
 
 ---
 
@@ -364,21 +673,27 @@ python iot_device_simulator.py [选项]
 ### 9.1 前置条件
 
 ```powershell
-# 确认 Azure CLI 已登录
+# 切换到 Azure 中国云并登录
+az cloud set --name AzureChinaCloud
 az login
 az account show --query name -o tsv
 
 # 确认当前目录
-cd C:\Users\JieYin\Downloads\iot_simulator
+cd C:\Projects\iot_simulator
 ```
+
+> 已在 §2.3 完成 IoT Hub + DPS + 两个 Enrollment Group 的创建, 并取得各组的 ID Scope 与组主密钥。
 
 ### 9.2 一键部署 (推荐)
 
 ```powershell
 .\deploy-to-azure.ps1 `
     -ResourceGroup "rg-iot-simulator" `
-    -Location "eastasia" `
-    -IoTHubConnectionString "HostName=<hub>.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=<key>" `
+    -Location "chinanorth3" `
+    -IdScopeSensors "0ne00XXXXXX" `
+    -GroupKeySensors "<sensors 组主密钥>" `
+    -IdScopeEnergy "0ne00XXXXXX" `
+    -GroupKeyEnergy "<energy 组主密钥>" `
     -SendInterval 10 `
     -MessageCount 0
 ```
@@ -387,8 +702,10 @@ cd C:\Users\JieYin\Downloads\iot_simulator
 1. 创建资源组
 2. 创建 Azure Container Registry (ACR)
 3. 在云端构建 Docker 镜像 (无需本地安装 Docker)
-4. 部署为 Azure Container Instance
-5. 13 个设备开始并发发送遥测数据
+4. 部署为 Azure Container Instance, 通过**安全环境变量**注入 DPS ID Scope 与组主密钥
+5. 13 个设备经 DPS 注册后开始并发发送遥测数据
+
+> 组主密钥通过 `--secure-environment-variables` 注入, 在 Portal 中不可见, 也不会写入镜像。
 
 ### 9.3 手动分步部署
 
@@ -398,7 +715,7 @@ cd C:\Users\JieYin\Downloads\iot_simulator
 
 ```powershell
 $RG = "rg-iot-simulator"
-$LOCATION = "eastasia"
+$LOCATION = "chinanorth3"
 $ACR = "acriotsim01"
 
 az group create --name $RG --location $LOCATION
@@ -419,8 +736,6 @@ $ACR_SERVER = az acr show --name $ACR --query loginServer -o tsv
 $ACR_USER   = az acr credential show --name $ACR --query username -o tsv
 $ACR_PASS   = az acr credential show --name $ACR --query "passwords[0].value" -o tsv
 
-$IOT_CONN = "HostName=<hub>.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=<key>"
-
 az container create `
     --resource-group $RG `
     --name iot-simulator `
@@ -430,8 +745,12 @@ az container create `
     --registry-password $ACR_PASS `
     --cpu 0.5 --memory 0.5 `
     --restart-policy Always `
-    --command-line "python iot_device_simulator.py --mode multi --interval 10 --count 0"  `
-    --environment-variables "IOTHUB_CONNECTION_STRING=$IOT_CONN"
+    --command-line "python iot_device_simulator.py --mode multi --config simulator_config.json --interval 10 --count 0" `
+    --secure-environment-variables `
+        "DPS_IDSCOPE_SENSORS=0ne00XXXXXX" `
+        "DPS_GROUPKEY_SENSORS=<sensors 组主密钥>" `
+        "DPS_IDSCOPE_ENERGY=0ne00XXXXXX" `
+        "DPS_GROUPKEY_ENERGY=<energy 组主密钥>"
 ```
 
 ### 9.4 运维操作
@@ -489,14 +808,18 @@ az container create `
     --cpu 0.5 --memory 0.5 `
     --restart-policy Always `
     --command-line "python iot_device_simulator.py --mode multi --config simulator_config.json" `
-    --secure-environment-variables "IOTHUB_CONNECTION_STRING=$IOT_CONN"
+    --secure-environment-variables `
+        "DPS_IDSCOPE_SENSORS=0ne00XXXXXX" `
+        "DPS_GROUPKEY_SENSORS=<sensors 组主密钥>" `
+        "DPS_IDSCOPE_ENERGY=0ne00XXXXXX" `
+        "DPS_GROUPKEY_ENERGY=<energy 组主密钥>"
 ```
 
-> **提示**: 使用 `--secure-environment-variables` 代替 `--environment-variables` 可以在 Portal 中隐藏连接字符串。
+> **提示**: `--secure-environment-variables` 注入的组主密钥在 Portal 中不可见, 且不会写入镜像。
 
 ### 9.7 费用估算
 
-| 配置 | 单价 (East Asia) | 月费用 (持续运行) |
+| 配置 | 单价 (China North 3) | 月费用 (持续运行) |
 |---|---|---|
 | 0.5 vCPU + 0.5 GB | ~$0.05/天 | ~$1.5/月 |
 | 1 vCPU + 1 GB | ~$0.10/天 | ~$3/月 |

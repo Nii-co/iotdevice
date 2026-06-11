@@ -316,6 +316,7 @@ az storage container create --account-name <stacct> -n raw --auth-mode login
 # 内网 ACI 示例（在已委派的子网中运行）
 az container create -g <rg> --name iot-simulator `
   --image <acr>.azurecr.io/iot-device-simulator:latest `
+  --os-type Linux `
   --vnet <vnet> --subnet subnet-aci `
   --cpu 0.5 --memory 0.5 --restart-policy Always
 ```
@@ -740,11 +741,13 @@ az container create `
     --resource-group $RG `
     --name iot-simulator `
     --image "$ACR_SERVER/iot-device-simulator:latest" `
+    --os-type Linux `
     --registry-login-server $ACR_SERVER `
     --registry-username $ACR_USER `
     --registry-password $ACR_PASS `
     --cpu 0.5 --memory 0.5 `
     --restart-policy Always `
+    --environment-variables "PYTHONUNBUFFERED=1" `
     --command-line "python iot_device_simulator.py --mode multi --config simulator_config.json --interval 10 --count 0" `
     --secure-environment-variables `
         "DPS_IDSCOPE_SENSORS=0ne00XXXXXX" `
@@ -802,11 +805,13 @@ az container create `
     --resource-group $RG `
     --name iot-simulator `
     --image "$ACR_SERVER/iot-device-simulator:latest" `
+    --os-type Linux `
     --registry-login-server $ACR_SERVER `
     --registry-username $ACR_USER `
     --registry-password $ACR_PASS `
     --cpu 0.5 --memory 0.5 `
     --restart-policy Always `
+    --environment-variables "PYTHONUNBUFFERED=1" `
     --command-line "python iot_device_simulator.py --mode multi --config simulator_config.json" `
     --secure-environment-variables `
         "DPS_IDSCOPE_SENSORS=0ne00XXXXXX" `

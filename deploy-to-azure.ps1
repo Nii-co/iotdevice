@@ -114,6 +114,7 @@ az container create `
     --resource-group $ResourceGroup `
     --name $ContainerName `
     --image "${acrServer}/${ImageName}:${ImageTag}" `
+    --os-type Linux `
     --registry-login-server $acrServer `
     --registry-username $acrUser `
     --registry-password $acrPass `
@@ -125,6 +126,7 @@ az container create `
         "CONFIG_PATH=simulator_config.json" `
         "INTERVAL=$SendInterval" `
         "COUNT=$MessageCount" `
+        "PYTHONUNBUFFERED=1" `
     --secure-environment-variables `
         "DPS_IDSCOPE_SENSORS=$IdScopeSensors" `
         "DPS_GROUPKEY_SENSORS=$GroupKeySensors" `

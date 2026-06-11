@@ -8,6 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY iot_device_simulator.py .
 COPY simulator_config.json .
 
+# 关闭 stdout 缓冲, 使日志实时输出到 az container logs
+ENV PYTHONUNBUFFERED=1
+
 # 默认多设备模式, 通过环境变量覆盖参数
 ENV MODE="multi"
 ENV CONFIG_PATH="simulator_config.json"
